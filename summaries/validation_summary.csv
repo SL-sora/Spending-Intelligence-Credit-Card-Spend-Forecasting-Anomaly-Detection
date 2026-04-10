@@ -1,0 +1,8 @@
+category,mae,rmse,median_pct_error,coverage,weeks_validated
+Food and Drink,78.07,93.99,64.4,87.1,62
+Travel,315.49,552.5,55.2,81.5,65
+Shopping,544.26,747.32,91.6,96.9,65
+Groceries,195.21,236.76,30.0,75.4,65
+Entertainment,125.53,160.38,61.4,89.1,64
+Health,176.01,220.43,44.7,86.2,65
+Utilities,130.11,151.44,48.4,83.1,65
