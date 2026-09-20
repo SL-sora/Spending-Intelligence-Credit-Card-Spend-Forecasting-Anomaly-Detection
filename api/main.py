@@ -5,10 +5,12 @@ from fastapi import HTTPException
 from fastapi import Request
 from fastapi import UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import sys
 import os
 import logging
 from uuid import uuid4
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model.anomaly import run_anomaly_check
 from model.train import load_transactions, train_all_models_for_user
@@ -29,18 +31,31 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-allowed_origins = [
-    origin.strip()
-    for origin in os.getenv(
-        "CORS_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000",
-    ).split(",")
-    if origin.strip()
-]
+MAX_CSV_UPLOAD_BYTES = int(os.getenv("MAX_CSV_UPLOAD_BYTES", "5242880"))
+API_TOKEN = os.getenv("API_TOKEN")
+
+
+def require_api_token(request: Request):
+    if not API_TOKEN:
+        return
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail={"message": "Authentication required."})
+    token = auth_header.split(" ", 1)[1].strip()
+    if token != API_TOKEN:
+        raise HTTPException(status_code=401, detail={"message": "Invalid API token."})
+
+
+def get_allowed_origins():
+    origins = os.getenv("CORS_ORIGINS")
+    if origins:
+        return [origin.strip() for origin in origins.split(",") if origin.strip()]
+    return ["http://localhost:3000", "http://127.0.0.1:3000"]
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=get_allowed_origins(),
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     allow_credentials=False,
@@ -52,13 +67,47 @@ def root():
     return {"status": "Spending Intelligence API is running"}
 
 
+@app.middleware("http")
+async def enforce_api_auth(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    if request.url.path in {"/", "/docs", "/openapi.json", "/redoc"}:
+        return await call_next(request)
+    if API_TOKEN:
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(status_code=401, content={"message": "Authentication required."})
+        token = auth_header.split(" ", 1)[1].strip()
+        if token != API_TOKEN:
+            return JSONResponse(status_code=401, content={"message": "Invalid API token."})
+    return await call_next(request)
+
+
 def get_request_id(request: Request):
     return request.headers.get("x-request-id") or str(uuid4())
+
+
+def _validate_csv_upload(file: UploadFile, raw: bytes, request_id: str):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail={"request_id": request_id, "message": "Missing file name."})
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail={"request_id": request_id, "message": "Only .csv files are supported."})
+    if len(raw) == 0:
+        raise HTTPException(status_code=400, detail={"request_id": request_id, "message": "Empty file."})
+    if len(raw) > MAX_CSV_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "request_id": request_id,
+                "message": f"File exceeds the maximum upload size of {MAX_CSV_UPLOAD_BYTES} bytes.",
+            },
+        )
 
 
 @app.get("/anomaly/check/{user_id}", response_model=AnomalyCheckResponse)
 def check_anomalies(user_id: int, request: Request):
     request_id = get_request_id(request)
+    require_api_token(request)
     payload = run_anomaly_check(user_id, CATEGORIES, BUDGETS, request_id=request_id)
     if not payload["results"] and payload["errors"]:
         raise HTTPException(
@@ -66,14 +115,16 @@ def check_anomalies(user_id: int, request: Request):
             detail={
                 "request_id": request_id,
                 "message": "No category checks completed successfully.",
-                "errors": payload["errors"]
-            }
+                "errors": payload["errors"],
+            },
         )
     return {"request_id": request_id, "user_id": user_id, **payload}
+
 
 @app.get("/anomaly/check/{user_id}/{category}", response_model=AnomalyCheckResponse)
 def check_single_category(user_id: int, category: str, request: Request):
     request_id = get_request_id(request)
+    require_api_token(request)
     payload = run_anomaly_check(user_id, [category], BUDGETS, request_id=request_id)
     if not payload["results"] and payload["errors"]:
         error = payload["errors"][0]
@@ -87,6 +138,7 @@ def check_single_category(user_id: int, category: str, request: Request):
 @app.get("/model/quality/{user_id}", response_model=ModelQualityResponse)
 def model_quality_report(user_id: int, request: Request):
     request_id = get_request_id(request)
+    require_api_token(request)
     metrics = []
     errors = []
 
@@ -97,16 +149,17 @@ def model_quality_report(user_id: int, request: Request):
                 errors.append({
                     "category": category,
                     "error_type": "not_enough_data",
-                    "message": f"Need at least 16 weeks, got {len(weekly)}."
+                    "message": f"Need at least 16 weeks, got {len(weekly)}.",
                 })
                 continue
             results_df, err_values = walk_forward_validate(weekly)
             metrics.append(build_metrics(category, results_df, err_values))
         except Exception as exc:
+            logging.exception("Quality validation failed for user_id=%s category=%s", user_id, category)
             errors.append({
                 "category": category,
                 "error_type": "validation_error",
-                "message": str(exc)
+                "message": "Validation failed for this category.",
             })
 
     if not metrics and errors:
@@ -139,12 +192,9 @@ async def ingest_csv(
     account_id: str = Form("csv_import"),
 ):
     request_id = get_request_id(request)
+    require_api_token(request)
     raw = await file.read()
-    if not raw:
-        raise HTTPException(
-            status_code=400,
-            detail={"request_id": request_id, "message": "Empty file."},
-        )
+    _validate_csv_upload(file, raw, request_id)
     try:
         result = import_statement_csv(
             raw,
@@ -153,9 +203,10 @@ async def ingest_csv(
             account_id=account_id,
         )
     except ValueError as exc:
+        logging.warning("CSV ingest validation failed for user_id=%s: %s", user_id, exc)
         raise HTTPException(
             status_code=400,
-            detail={"request_id": request_id, "message": str(exc)},
+            detail={"request_id": request_id, "message": "Invalid CSV data."},
         ) from exc
     return {
         "request_id": request_id,
@@ -185,12 +236,9 @@ async def csv_anomaly_report(
     Returns ingest stats, training stats, per-category anomaly results, and a short summary.
     """
     request_id = get_request_id(request)
+    require_api_token(request)
     raw = await file.read()
-    if not raw:
-        raise HTTPException(
-            status_code=400,
-            detail={"request_id": request_id, "message": "Empty file."},
-        )
+    _validate_csv_upload(file, raw, request_id)
 
     try:
         ingest_result = import_statement_csv(
@@ -200,9 +248,10 @@ async def csv_anomaly_report(
             account_id=account_id,
         )
     except ValueError as exc:
+        logging.warning("CSV report ingest failed for user_id=%s: %s", user_id, exc)
         raise HTTPException(
             status_code=400,
-            detail={"request_id": request_id, "message": str(exc)},
+            detail={"request_id": request_id, "message": "Invalid CSV data."},
         ) from exc
 
     if retrain_models:
